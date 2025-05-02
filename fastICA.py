@@ -1,52 +1,91 @@
 import numpy as np
+from numpy.linalg import svd, pinv
 
-def fast_ica(X, num_components, max_iter=200, tol=1e-5):
+def fast_ica(
+        X,                       # shape (n_signals, n_samples)
+        n_components=None,       # ≤ n_signals
+        fun="tanh",              # 'tanh' (log-cosh), 'cube', 'exp'
+        alpha=1.0,               # scaling for tanh
+        max_iter=1000,
+        tol=1e-8,
+        random_state=None,
+        whiten=True,
+):
     """
-    FastICA algorithm from scratch
-    X: B x N numpy array (bands x pixels)
-    num_components: how many ICs to extract
+    Lightweight FastICA (deflation) inspired by your snippet.
+
+    Returns
+    -------
+    S : (n_components, n_samples) – estimated independent sources
+    W : (n_components, n_components) – un-mixing matrix
+    A : (n_components, n_components) – mixing matrix  (≈ pinv(W))
     """
-    B, N = X.shape
+    rng = np.random.default_rng(random_state)
+    X = np.asarray(X, dtype=np.float64)
+    m, n = X.shape                      # m = observed mixtures
 
-    # 1. Centering
-    X = X - np.mean(X, axis=1, keepdims=True)
+    if n_components is None:
+        n_components = m
+    if n_components > m:
+        raise ValueError("n_components cannot exceed number of signals (rows).")
 
-    # 2. Whitening
-    cov = np.cov(X)
-    eig_vals, eig_vecs = np.linalg.eigh(cov)
-    D_inv_sqrt = np.diag(1.0 / np.sqrt(eig_vals))
-    whitening_matrix = D_inv_sqrt @ eig_vecs.T
-    X_white = whitening_matrix @ X
+    # ------------------------------------------------------------------
+    # 1.  center
+    X -= X.mean(axis=1, keepdims=True)
 
-    # 3. FastICA
-    def g(u):
-        return np.tanh(u)
+    # ------------------------------------------------------------------
+    # 2.  whiten  (optional)
+    if whiten:
+        U, s, _ = svd(X, full_matrices=False)
+        K = (U[:, :n_components] / s[:n_components]).T      # whitening mat
+        Xw = K @ X                                          # shape (k, n)
+    else:
+        K = np.eye(n_components, m)
+        Xw = X.copy()
 
-    def g_prime(u):
-        return 1 - np.tanh(u) ** 2
+    # precompute for efficiency
+    n_inv = 1.0 / n
 
-    W = np.zeros((num_components, B))
+    # ------------------------------------------------------------------
+    # 3.  choose non-linearity
+    if fun == "tanh":
+        def g(u):  return np.tanh(alpha * u), alpha * (1.0 - np.tanh(alpha * u)**2)
+    elif fun == "cube":
+        def g(u):  return u**3, 3 * u**2
+    elif fun == "exp":
+        def g(u):  exp = np.exp(-(u**2) / 2);  return u * exp, (1 - u**2) * exp
+    else:
+        raise ValueError("fun must be 'tanh', 'cube' or 'exp'")
 
-    for i in range(num_components):
-        w = np.random.randn(B)
-        w = w / np.linalg.norm(w)
+    # ------------------------------------------------------------------
+    # 4.  deflationary FastICA
+    W = np.zeros((n_components, n_components))
+    for p in range(n_components):
+        w = rng.standard_normal(n_components)
+        w /= np.linalg.norm(w)
 
         for _ in range(max_iter):
-            wx = w @ X_white
-            w_new = np.mean(X_white * g(wx), axis=1) - np.mean(g_prime(wx)) * w
+            wx = w @ Xw                        # shape (n,)
+            gwx, g_wx = g(wx)
 
-            # Orthogonalize against previous components
-            if i > 0:
-                w_new -= W[:i] @ (W[:i] @ w_new)
+            # update rule
+            w_new = (gwx @ Xw.T) * n_inv - g_wx.mean() * w
 
-            w_new = w_new / np.linalg.norm(w_new)
+            # Gram–Schmidt against previous components
+            if p:
+                w_new -= (W[:p] @ w_new) @ W[:p]
 
-            if np.abs(np.abs(np.dot(w, w_new)) - 1.0) < tol:
+            w_new /= np.linalg.norm(w_new)
+
+            # check convergence (|cos(angle)| → 1)
+            if abs(np.dot(w_new, w)) > 1 - tol:
                 break
-
             w = w_new
 
-        W[i, :] = w
+        W[p] = w_new
 
-    S = W @ X_white  # Independent components
+    # ------------------------------------------------------------------
+    # 5.  sources and mixing
+    S = W @ Xw                            # (k, n)
+
     return S
